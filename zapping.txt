@@ -1,0 +1,243 @@
+Created by Tiago Alves Ferreira, Vodafone, last modified by Anbarasu Lakshmanan, Vodafone on May 15, 2024
+Contents
+Goal
+Rationale
+General Rules
+Requirements
+STB MW
+STB UI
+DMS
+Kaltura BE
+
+
+Related Specs
+CI004 - Channel line up management
+Target Date	
+Release	
+Epic	
+VFGTV-31155 - [LB] Improved Channel Zapping - Optimized UI performance IN PROGRESS
+
+VTVAS-9418 - Optimize the zapping time under ATV 11 with MCAST OPEN
+
+Market	
+GROUP
+Platform	
+
+
+Document status	
+
+Last Modified	
+May 15, 2024 09:22
+
+
+
+
+Goal
+Improving zapping performance and resiliency agains BE outages.
+
+
+
+Rationale
+Zapping performance is dependent on the existence of all the required data necessary for authorisation (entitlement and licenses) and control (parental and otherwise).
+
+Open devices can only run OTT streams, and, because VTV hardware root of trust is not present, license acquisition must be done 
+
+Channel zapping has 3 main performance and functional goals:
+
+Zapping time - In this scope, we can distinguish between technical zapping time, and user zapping time
+Technical zapping time - corresponds to the time between the key down action, and the fire full video decoded frame.
+User zapping time - corresponds to the user perceived zapping time. As is a user-driven analysis, it might consider several aspects, such as the moment the screen goes black until the moment the next channel's first frame appears (maybe not in full video decoding), and might even include tricks such as delaying the moment the screen freezes or goes black, or showing a content related background. However, in this scope, user zapping time is defined as time of back screen between channels.
+Zapping correctness - Is the user authorised to zap to given channel, both from an entitlement perspective, or from a parental control perspective
+Resiliency - What happens when PR information is not readily available and how different markets view and consider it critical. Some markets might prioritise performance vs PR enforcement.
+
+
+Therefore, the following scenarios need to be considered:
+
+PR enabled / Disabled
+EIT availability
+Need to have PR information
+Managing each of those scenarios will require specific configurations to adapt to market realities.
+
+In order to extract the best possible performance, the zapping process must be as paralysed as possible, at the cost of complexity. Considering zapping is the action the user most performs on a STB, it's well worth the cost. Parallelising zapping means that the following operations must be initiated by the following order, completed in parallel, and depending on the conclusion times, wait for some or all to actually enable the video:
+
+Tuner to channel
+Start zapping timeout
+Fetch metadata from the Network
+Check concurrency and other business rules
+Fetch metadata from EIT
+This order includes the following considerations:
+
+Most often, running to the channel (physically or logically) is the most expensive and lengthy step. Therefore, it must be the first. It might be to a DVB-C source (which includes the actually physical tuning), or a multicast source, or an OTT source (which might require acquiring a license)
+Fetching metadata is expected to take near zero time. In reality it goes from 15ms using AWS CDN, to around 250ms (worst case scenario for CDN, or 170ms if directly from the BE). Under some setup, acquiring EPG is the only necessary check, therefore, it must be right after the tune command.
+Optionally - Check concurrently - This is only performed on OTT cases. It's expected to take less than 500ms. It has no dependencies
+Optionally - Fetch metadata com EIT - This step can actually only be performed after the frequency tune is concluded, which takes around 150ms. So it wouldn't be worth starting it before
+Then, actually displaying the tuned channel depends on the following conditions:
+
+Content parental rating doesn't exceed that of the configuration, if configured
+Business rules aren't breached, if any
+EIT information matches that coming from the EPG, if EITs are available.
+For some markets, it might be acceptable to show a channel for a fraction of a second, if EPG information isn't yet available, whereas other might not allow it, except in extreme cases. This decision point must therefore be modelled by a configuration:
+
+AgeRatingsLive:
+preferred - channel is displayed after having received one (EPG from network, or EIT) source of EPG information 
+true - channel must on only be displayed after the mandatory source of EPG is available (BE from all IP based sources, EIT for cable sources)
+false (default) - Equivalent to having parental control disabled. Channel is displayed no matter the content's parental rating
+PRZappingTimeout - The time a zapping operations waits to receive parental rating information.
+Also, channels whose metadata marks is as "Adult" can never be displayed unless a parental information check is performed, or a proper PIN is inserted.
+
+Finally, non-adult channels shall be displayed if zapping timeout expires.
+
+This new method aims to find a balance between performance and resiliency, namely:
+
+Zapping performance is the best possible, under ideal conditions, for the given security requirements, e.i. EIT need vs no PR check
+Performance is optimised for a market basis. Markets choosing to favor performance, will optimise performance. Other might choose security. 
+in case of BE unavailability, or EIT unavailability, channels PR control will be relying on the channel's default rating, allowing for unmatched performance for most cases.
+
+
+
+
+General Rules
+
+
+Nominal Workflow
+
+OTT Zapping
+
+The client implementation shall support the following DMS settings:
+AgeRatingsLive - Containing an enumeration:
+0 - False - Live channel is allowed to be played, until a PR is obtained and prevents it. (this is the default value)
+1 - True - Live channel is only allowed to be played, unless a PR exists and allows it, or times out
+2 - Preferred - Live channel is only allowed to be played, when EIT data confirms PR. If the channel is only available on OTT, then this parameter has the same effect as "True".
+The following build time parameter shall also be defined:
+"zappingTimeout" - Set to 5 seconds
+Also, the channel-based metadata is also defined, as media/Tags/"Parental Rating", henceforth:
+"parentalRating" - This parameter contains the channel's default rating. 
+Therefore, the following rules applies:
+Upon p+/p- keydown, or when the numerical zapping is concluded, or any other zapping action is to be performed, the client implementation shall immediately start the following actions, at the order defined here:
+Tune to channel ( broadcast or OTT)
+Start the zappingTimeout timer
+Fetch EPG metadata which includes the current event
+Fetch GetPlaybackContext, if applicable
+If channel is DVB-C or T attempt to fetch EIT present information of the target channel. Ignore if target channel is OTT or Multicast
+When the tune action is ready to start decoding of the channel, the following decision is required:
+If AgeRatingsLive = 0, then make the decoded video immediately available
+If AgeRatingsLive = 1, then wait for the BE EPG to become available and apply the parental data accordingly. It's expected that all BE EPG data to arrive much sooner than any (all but cable FCC) channel tune operation
+if AgeRatingsLive = 2, and channel is DVBC or DVBT, then decoded video shall only become available when EIT present information is available
+If zappingTimeout expires and the channel is not yet being decoded, then the client implementation shall check the channel's parentalRating. If the channel's parental rating is below the device's configuration, then the channel shall be decoded, otherwise is shall display the "Channel Locked" information, and request a PIN.
+If GetPlaybackContext response is negative (or empty depending on the case), and the channel is already being decoded, then playback shall be stopped. 
+
+
+
+
+
+
+
+
+Requirements
+STB MW
+CI004.003-RMW001	N/A	
+
+STB UI
+CI004.003-RUI0010	At CLU generation time, the channel metadata parameter parentalRating, present on media/Tags/"Parental Rating",  shall be fetched, processed, and persistently stored, along with the remaining CLU data model	
+VFGTV-36652 - Channel default rating RESOLVED
+
+VTVAS-9572 - Channel default rating RESOLVED
+
+
+
+CI004.003-RUI0011	At CLU generation time, the channel lock status shall be cached as well.	
+VTVAS-9582 - Zapping process - Isolate tune process RESOLVED
+
+
+
+CI004.003-RUI0020	
+On boot, the DMS parameter AgeRatingsLive, shall be fetched, with the following valid integer values:
+
+0 - False - Live channel is allowed to be played, until a PR is obtained and prevents it. (this is the default value, or if value is not an integer)
+1 - True - Live channel is only allowed to be played, unless a PR exists and allows it, or times out
+2 - Preferred - Live channel is only allowed to be played, when EIT data confirms PR. If the channel is only available on OTT, then this parameter has the same effect as "True".
+VFGTV-36651 - AgeRatingsLive DMS settings RESOLVED VTVAS-9573 - AgeRatingsLive DMS settings RESOLVED
+
+
+CI004.003-RUI0030	If parental control is disabled at device level, then all channels shall be assumed as having AgeRatingsLive=false	
+VFGTV-36653 - Ignore rating if parental control is disabled RESOLVED VTVAS-9574 - Ignore rating if parental control is disabled RESOLVED
+
+
+CI004.003-RUI0040	
+At build time, the variable "zappingTimeout" shall be set to 5 seconds
+
+VFGTV-36654 - Implement ZappingTimeout RESOLVED VTVAS-9575 - Implement ZappingTimeout RESOLVED
+
+
+CI004.003-RUI0049	
+Before any zapping action is taken, channel level lock shall be checked.
+
+VTVAS-9582 - Zapping process - Isolate tune process RESOLVED
+
+
+CI004.003-RUI0050	
+Upon p+/p- keydown, or when the numerical zapping is concluded, or any other zapping action is to be performed, the client implementation shall immediately start the following actions, at the order defined here:
+
+Tune to channel ( broadcast or OTT)
+Start the zappingTimeout timer
+Fetch EPG metadata which includes the current event, and 
+Fetch GetPlaybackContext, if applicable
+If channel is DVB-C or T attempt to fetch EIT present information of the target channel. Ignore if target channel is OTT or Multicast
+VFGTV-36655 - Zapping process RESOLVED VTVAS-9582 - Zapping process - Isolate tune process RESOLVED
+
+EIT information is not available on Android TV devices, and therefore shall be ignored.
+CI004.003-RUI0060	
+When the tune action is ready to start decoding of the channel, the following decision is required:
+
+If AgeRatingsLive = 0, then make the decoded video immediately available
+If AgeRatingsLive = 1, then wait for the BE EPG to become available and apply the parental data accordingly. It's expected that all BE EPG data to arrive much sooner than any (all but cable FCC) channel tune operation
+if AgeRatingsLive = 2, and channel is DVBC or DVBT, then decoded video shall only become available when EIT present information is available
+VFGTV-36656 - Apply PR on zapping RESOLVED VTVAS-9583 - Apply PR on zapping RESOLVED
+
+
+CI004.003-RUI0070	
+If zappingTimeout expires and the channel is not yet being decoded, then the client implementation shall check the channel's parentalRating. If the channel's parental rating is below the device's configuration, then the channel shall be decoded, otherwise is shall display the "Channel Locked" information, and request a PIN.
+
+VFGTV-36657 - Zapping timeout expiry RESOLVED VTVAS-9584 - Zapping timeout expiry RESOLVED
+
+
+CI004.003-RUI0080	
+If GetPlaybackContext response is negative (or empty depending on the case), and the channel is already being decoded, then playback shall be stopped. 
+
+VFGTV-36658 - Zapping if GetPlaybackcontext is negative RESOLVED VTVAS-9585 - Zapping if GetPlaybackcontext is negative RESOLVED
+
+
+CI004.003-RUI0090	
+On boot, the DMS parameter EnforcedGPCLive, shall be fetched, with the following valid integer values:
+
+0 - False - Live channel is allowed to be played if BE is unreachable (due to offline, or due to an HTTP 429 on the getPlaybackContext response. This is the default value.
+1 - True - Live channel not is allowed to be played if BE is unreachable (due to offline, or due to an HTTP 429 on the getPlaybackContext response.
+VFGTV-38973 - Support for EnforcedGPCLive RESOLVED VTVAS-9587 - Support for EnforcedGPCLive RESOLVED
+
+
+DMS
+CI004.003-RDM001	
+DMS shall support the AgeRatingsLive parameter, containing an integer, corresponding to the following enumeration:
+
+0 - False - Live channel is allowed to be played, until a PR is obtained and prevents it. (this is the default value, or if value is not an integer)
+1 - True - Live channel is only allowed to be played, unless a PR exists and allows it, or times out
+2 - Preferred - Live channel is only allowed to be played, when EIT data confirms PR. If the channel is only available on OTT, then this parameter has the same effect as "True".
+Ex,
+
+"AgeRatingsLive":"0",
+
+"AgeRatingsLive":"1",
+
+"AgeRatingsLive":"2",
+
+
+CI004.003-RDM002	
+On boot, the DMS parameter EnforcedGPCLive, shall be fetched, with the following valid integer values:
+
+0 - False - Live channel is allowed to be played if BE is unreachable (due to offline, or due to an HTTP 429 on the getPlaybackContext response.  This is the default value.
+1 - True - Live channel not is allowed to be played if BE is unreachable (due to offline, or due to an HTTP 429 on the getPlaybackContext response.
+Ex,
+
+"EnforcedGPCLive":"0",
+
+"EnforcedGPCLive":"1",
